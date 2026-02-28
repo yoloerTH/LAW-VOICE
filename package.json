@@ -1,0 +1,23 @@
+{
+  "name": "lexflow-voice-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "dev": "node --watch server.js",
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@deepgram/sdk": "^4.11.3",
+    "@supabase/supabase-js": "^2.93.3",
+    "axios": "^1.6.5",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "node-fetch": "^3.3.2",
+    "openai": "^4.76.1",
+    "socket.io": "^4.7.4"
+  }
+}
