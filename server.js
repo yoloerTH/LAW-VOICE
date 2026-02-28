@@ -18,6 +18,7 @@ const httpServer = createServer(app)
 // Configure CORS
 const allowedOrigins = [
   'https://candid-tiramisu-94f8cb.netlify.app',
+  'https://law-voice-production.up.railway.app',
   'http://localhost:3000',
   'http://localhost:5173'
 ]
