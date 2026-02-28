@@ -326,7 +326,22 @@ io.on('connection', async (socket) => {
   })
 })
 
-// Handle user message with pipelined streaming
+// Detect if a message needs real data from n8n (queries about letters, clients, statuses, etc.)
+function needsDataLookup(message) {
+  const dataPatterns = [
+    /how many/i, /status/i, /check/i, /look up/i, /find/i, /search/i,
+    /list/i, /show me/i, /tell me about/i, /unsigned/i, /signed/i,
+    /sent/i, /draft/i, /opened/i, /overdue/i, /pending/i,
+    /create.*letter/i, /new.*letter/i, /generate.*letter/i,
+    /send.*letter/i, /send.*email/i, /remind/i,
+    /client/i, /matter/i, /letter/i, /engagement/i,
+    /what.*letters/i, /which.*letters/i, /who/i,
+    /analytics/i, /report/i, /summary/i, /total/i, /count/i
+  ]
+  return dataPatterns.some(p => p.test(message))
+}
+
+// Handle user message: LLM responds first, then n8n fetches real data if needed
 async function handleUserMessage(socket, session, userMessage, pipeline = null) {
   try {
     session.conversationHistory.push({
@@ -343,6 +358,7 @@ async function handleUserMessage(socket, session, userMessage, pipeline = null) 
     const ttsWorkerPromise = startTTSWorker(socket, session, ttsQueue, pipeline)
 
     try {
+      // Step 1: LLM gives quick conversational response
       console.log('Starting LLM stream...')
       for await (const chunk of session.llm.streamResponse(session.conversationHistory)) {
         if (pipeline && pipeline.isAborted()) {
@@ -365,12 +381,56 @@ async function handleUserMessage(socket, session, userMessage, pipeline = null) 
         if (pipeline && pipeline.isAborted()) break
       }
 
-      // Handle remaining text
+      // Handle remaining text from LLM
       const remainder = detector.getRemainder()
       if (remainder && remainder.length > 0 && (!pipeline || !pipeline.isAborted())) {
         fullResponse += remainder
         socket.emit('ai-response', { text: remainder, partial: true })
         ttsQueue.push(remainder)
+      }
+
+      // Step 2: If the message needs real data, send to n8n and speak the result
+      if (needsDataLookup(userMessage) && (!pipeline || !pipeline.isAborted())) {
+        console.log('Message needs data lookup, sending to n8n...')
+        socket.emit('status', 'Fetching data...')
+
+        try {
+          const webhookResult = await session.webhook.sendChatMessage(userMessage, session.id)
+          const n8nResponse = webhookResult?.data?.output || webhookResult?.data?.text || webhookResult?.data
+
+          if (n8nResponse && typeof n8nResponse === 'string' && n8nResponse.trim().length > 0 && (!pipeline || !pipeline.isAborted())) {
+            console.log(`n8n response: "${n8nResponse.substring(0, 100)}..."`)
+
+            // Clean markdown from n8n response for voice
+            const cleanResponse = n8nResponse
+              .replace(/\*\*/g, '')
+              .replace(/\*/g, '')
+              .replace(/#{1,6}\s/g, '')
+              .replace(/\|[^\n]+\|/g, '')
+              .replace(/-{3,}/g, '')
+              .replace(/\n{2,}/g, '. ')
+              .replace(/\n/g, '. ')
+              .trim()
+
+            if (cleanResponse.length > 0) {
+              // Split n8n response into sentences for TTS
+              const n8nSentences = cleanResponse.match(/[^.!?]+[.!?]+/g) || [cleanResponse]
+
+              for (const sentence of n8nSentences) {
+                if (pipeline && pipeline.isAborted()) break
+                const trimmed = sentence.trim()
+                if (trimmed.length > 0) {
+                  socket.emit('ai-response', { text: trimmed, partial: true })
+                  ttsQueue.push(trimmed)
+                  fullResponse += ' ' + trimmed
+                }
+              }
+            }
+          }
+        } catch (webhookError) {
+          console.error('n8n webhook error:', webhookError.message)
+          // Don't fail the whole response, LLM already gave a conversational reply
+        }
       }
 
     } finally {
