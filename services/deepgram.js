@@ -26,11 +26,9 @@ export class DeepgramService {
         vad_events: true,
         interim_results: true,
         endpointing: 300,
-        ...(options.encoding && {
-          encoding: options.encoding,
-          sample_rate: options.sample_rate || 16000,
-          channels: options.channels || 1
-        })
+        encoding: options.encoding || 'linear16',
+        sample_rate: options.sample_rate || 16000,
+        channels: options.channels || 1
       }
 
       this.connection = this.client.listen.live(config)
