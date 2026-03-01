@@ -341,6 +341,60 @@ function needsDataLookup(message) {
   return dataPatterns.some(p => p.test(message))
 }
 
+// Speak n8n response in its own independent TTS cycle (barge-in safe)
+async function speakN8nResponse(socket, session, n8nResponseText) {
+  try {
+    // Clean markdown from n8n response for voice
+    const cleanResponse = n8nResponseText
+      .replace(/\*\*/g, '')
+      .replace(/\*/g, '')
+      .replace(/#{1,6}\s/g, '')
+      .replace(/\|[^\n]+\|/g, '')
+      .replace(/-{3,}/g, '')
+      .replace(/\n{2,}/g, '. ')
+      .replace(/\n/g, '. ')
+      .replace(/- /g, '')
+      .trim()
+
+    if (!cleanResponse.length) return
+
+    // Split into sentences for TTS
+    const sentences = cleanResponse.match(/[^.!?]+[.!?]+/g) || [cleanResponse]
+    let spokenText = ''
+
+    socket.emit('status', 'AI is speaking...')
+
+    for (const sentence of sentences) {
+      const trimmed = sentence.trim()
+      if (!trimmed.length) continue
+
+      console.log(`n8n sentence: "${trimmed.substring(0, 50)}..."`)
+      socket.emit('ai-response', { text: trimmed, partial: true })
+
+      try {
+        const audio = await session.cartesia.textToSpeech(trimmed)
+        socket.emit('audio-response', audio)
+        spokenText += ' ' + trimmed
+      } catch (err) {
+        console.error('TTS error for n8n sentence:', err.message)
+      }
+    }
+
+    // Add to conversation history so AI has context
+    if (spokenText.trim()) {
+      session.conversationHistory.push({
+        role: 'assistant',
+        content: spokenText.trim()
+      })
+    }
+
+    socket.emit('status', 'Listening...')
+    console.log('n8n response spoken successfully')
+  } catch (error) {
+    console.error('Error speaking n8n response:', error)
+  }
+}
+
 // Handle user message: LLM responds first, then n8n fetches real data if needed
 async function handleUserMessage(socket, session, userMessage, pipeline = null) {
   try {
@@ -351,6 +405,26 @@ async function handleUserMessage(socket, session, userMessage, pipeline = null) 
 
     socket.emit('status', 'AI is thinking...')
 
+    // Fire n8n request IMMEDIATELY in parallel (don't wait for LLM)
+    let n8nPromise = null
+    if (needsDataLookup(userMessage)) {
+      console.log('Message needs data lookup, sending to n8n in parallel...')
+      n8nPromise = session.webhook.sendChatMessage(userMessage, session.id)
+        .then(result => {
+          const response = result?.data?.output || result?.data?.text || result?.data
+          if (response && typeof response === 'string' && response.trim().length > 0) {
+            console.log(`n8n response received: "${response.substring(0, 100)}..."`)
+            return response
+          }
+          return null
+        })
+        .catch(err => {
+          console.error('n8n webhook error:', err.message)
+          return null
+        })
+    }
+
+    // Step 1: LLM gives quick conversational response
     const ttsQueue = new AsyncQueue()
     const detector = new SentenceDetector()
     let fullResponse = ''
@@ -358,7 +432,6 @@ async function handleUserMessage(socket, session, userMessage, pipeline = null) 
     const ttsWorkerPromise = startTTSWorker(socket, session, ttsQueue, pipeline)
 
     try {
-      // Step 1: LLM gives quick conversational response
       console.log('Starting LLM stream...')
       for await (const chunk of session.llm.streamResponse(session.conversationHistory)) {
         if (pipeline && pipeline.isAborted()) {
@@ -389,50 +462,6 @@ async function handleUserMessage(socket, session, userMessage, pipeline = null) 
         ttsQueue.push(remainder)
       }
 
-      // Step 2: If the message needs real data, send to n8n and speak the result
-      if (needsDataLookup(userMessage) && (!pipeline || !pipeline.isAborted())) {
-        console.log('Message needs data lookup, sending to n8n...')
-        socket.emit('status', 'Fetching data...')
-
-        try {
-          const webhookResult = await session.webhook.sendChatMessage(userMessage, session.id)
-          const n8nResponse = webhookResult?.data?.output || webhookResult?.data?.text || webhookResult?.data
-
-          if (n8nResponse && typeof n8nResponse === 'string' && n8nResponse.trim().length > 0 && (!pipeline || !pipeline.isAborted())) {
-            console.log(`n8n response: "${n8nResponse.substring(0, 100)}..."`)
-
-            // Clean markdown from n8n response for voice
-            const cleanResponse = n8nResponse
-              .replace(/\*\*/g, '')
-              .replace(/\*/g, '')
-              .replace(/#{1,6}\s/g, '')
-              .replace(/\|[^\n]+\|/g, '')
-              .replace(/-{3,}/g, '')
-              .replace(/\n{2,}/g, '. ')
-              .replace(/\n/g, '. ')
-              .trim()
-
-            if (cleanResponse.length > 0) {
-              // Split n8n response into sentences for TTS
-              const n8nSentences = cleanResponse.match(/[^.!?]+[.!?]+/g) || [cleanResponse]
-
-              for (const sentence of n8nSentences) {
-                if (pipeline && pipeline.isAborted()) break
-                const trimmed = sentence.trim()
-                if (trimmed.length > 0) {
-                  socket.emit('ai-response', { text: trimmed, partial: true })
-                  ttsQueue.push(trimmed)
-                  fullResponse += ' ' + trimmed
-                }
-              }
-            }
-          }
-        } catch (webhookError) {
-          console.error('n8n webhook error:', webhookError.message)
-          // Don't fail the whole response, LLM already gave a conversational reply
-        }
-      }
-
     } finally {
       ttsQueue.close()
       await ttsWorkerPromise
@@ -443,6 +472,17 @@ async function handleUserMessage(socket, session, userMessage, pipeline = null) 
         role: 'assistant',
         content: fullResponse
       })
+    }
+
+    // Step 2: Wait for n8n and speak result in its OWN independent TTS cycle
+    if (n8nPromise) {
+      const n8nResponse = await n8nPromise
+      if (n8nResponse) {
+        await speakN8nResponse(socket, session, n8nResponse)
+      } else {
+        socket.emit('status', 'Listening...')
+      }
+    } else {
       socket.emit('status', 'Listening...')
     }
 
